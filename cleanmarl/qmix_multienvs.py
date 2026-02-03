@@ -175,7 +175,7 @@ class ReplayBuffer:
     def sample(self, batch_size):
         indices = np.random.randint(0, self.size, size=batch_size)
         batch = [self.episodes[i] for i in indices]
-        lengths = [len(episode["obs"]) for episode in batch]
+        lengths = [len(episode["obs"]) - 1 for episode in batch]
         max_length = max(lengths)
         obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(self.device)
         avail_actions = torch.zeros(
@@ -192,13 +192,13 @@ class ReplayBuffer:
         mask = torch.zeros(batch_size, max_length, dtype=torch.bool).to(self.device)
         for i in range(batch_size):
             length = lengths[i]
-            obs[i, :length] = batch[i]["obs"]
+            obs[i, :length] = batch[i]["obs"][:-1]
             avail_actions[i, :length] = batch[i]["avail_actions"]
             actions[i, :length] = batch[i]["actions"]
             reward[i, :length] = batch[i]["reward"]
-            next_obs[i, :length] = batch[i]["next_obs"]
-            states[i, :length] = batch[i]["states"]
-            next_states[i, :length] = batch[i]["next_states"]
+            next_obs[i, :length] = batch[i]["obs"][1:]
+            states[i, :length] = batch[i]["states"][:-1]
+            next_states[i, :length] = batch[i]["states"][1:]
             done[i, :length] = batch[i]["done"]
             mask[i, :length] = 1
 
@@ -423,9 +423,7 @@ if __name__ == "__main__":
                 "obs": [],
                 "actions": [],
                 "reward": [],
-                "next_obs": [],
                 "states": [],
-                "next_states": [],
                 "done": [],
                 "avail_actions": [],
             }
@@ -481,11 +479,9 @@ if __name__ == "__main__":
                 episodes[j]["obs"].append(obs[i])
                 episodes[j]["actions"].append(actions[i])
                 episodes[j]["reward"].append(reward[i])
-                episodes[j]["next_obs"].append(next_obs[i])
                 episodes[j]["done"].append(done[i])
                 episodes[j]["avail_actions"].append(avail_action[i])
                 episodes[j]["states"].append(state[i])
-                episodes[j]["next_states"].append(next_state[i])
                 ep_reward[j] += reward[i]
                 ep_length[j] += 1
 
@@ -497,6 +493,8 @@ if __name__ == "__main__":
 
             for i, j in enumerate(alive_envs[:]):
                 if done[i] or truncated[i]:
+                    episodes[j]["obs"].append(next_obs[i])
+                    episodes[j]["states"].append(next_state[i])
                     alive_envs.remove(j)
                     rb.store(episodes[j])
                     episodes[j] = dict()

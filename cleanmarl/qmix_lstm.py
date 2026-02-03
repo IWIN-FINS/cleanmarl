@@ -179,7 +179,7 @@ class ReplayBuffer:
     def sample(self, batch_size):
         indices = np.random.randint(0, self.size, size=batch_size)
         batch = [self.episodes[i] for i in indices]
-        lengths = [len(episode["obs"]) for episode in batch]
+        lengths = [len(episode["obs"]) - 1 for episode in batch]
         max_length = max(lengths)
         obs = torch.zeros((batch_size, max_length, self.num_agents, self.obs_space)).to(self.device)
         avail_actions = torch.zeros(
@@ -192,18 +192,18 @@ class ReplayBuffer:
         )
         states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
         next_states = torch.zeros((batch_size, max_length, self.state_space)).to(self.device)
-        done = torch.zeros((batch_size, max_length)).to(self.device)
+        done = torch.ones((batch_size, max_length)).to(self.device)
         mask = torch.zeros(batch_size, max_length, dtype=torch.bool).to(self.device)
 
         for i in range(batch_size):
             length = lengths[i]
-            obs[i, :length] = batch[i]["obs"]
+            obs[i, :length] = batch[i]["obs"][:-1]
             avail_actions[i, :length] = batch[i]["avail_actions"]
             actions[i, :length] = batch[i]["actions"]
             reward[i, :length] = batch[i]["reward"]
-            next_obs[i, :length] = batch[i]["next_obs"]
-            states[i, :length] = batch[i]["states"]
-            next_states[i, :length] = batch[i]["next_states"]
+            next_obs[i, :length] = batch[i]["obs"][1:]
+            states[i, :length] = batch[i]["states"][:-1]
+            next_states[i, :length] = batch[i]["states"][1:]
             done[i, :length] = batch[i]["done"]
             mask[i, :length] = 1
 
@@ -348,9 +348,7 @@ if __name__ == "__main__":
             "obs": [],
             "actions": [],
             "reward": [],
-            "next_obs": [],
             "states": [],
-            "next_states": [],
             "done": [],
             "avail_actions": [],
         }
@@ -390,14 +388,13 @@ if __name__ == "__main__":
             episode["obs"].append(obs)
             episode["actions"].append(actions)
             episode["reward"].append(reward)
-            episode["next_obs"].append(next_obs)
             episode["done"].append(done)
             episode["avail_actions"].append(avail_action)
             episode["states"].append(state)
-            episode["next_states"].append(next_state)
-
             obs = next_obs
             state = next_state
+        episode["obs"].append(obs)
+        episode["states"].append(state)
         rb.store(episode)
         num_episode += 1
         ep_rewards.append(ep_reward)
