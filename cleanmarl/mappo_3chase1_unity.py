@@ -111,6 +111,8 @@ class RolloutBuffer:
         normalize_reward=False,
         device="cpu",
         role_ids=None,
+        obs_chaser_team_dim=None,
+        reward_chaser_team_dim=3,
     ):
         self.buffer_size = buffer_size
         self.num_agents = num_agents
@@ -123,7 +125,9 @@ class RolloutBuffer:
         self.pos = 0
         # Store fixed role_ids for all agents: [num_agents]
         self.role_ids = torch.from_numpy(role_ids).long().to(device) if role_ids is not None else None
-
+        # obs_chaser_team 的维度（3 * chaser_team_obs_dim = 39）
+        self.obs_chaser_team_dim = obs_chaser_team_dim if obs_chaser_team_dim else 39
+        self.reward_chaser_team_dim = reward_chaser_team_dim
     def add(self, episode):
         for key, values in episode.items():
             episode[key] = torch.from_numpy(np.stack(values)).float().to(self.device)
@@ -151,6 +155,14 @@ class RolloutBuffer:
         mask = torch.zeros(self.buffer_size, max_length, dtype=torch.bool).to(
             self.device
         )
+        # obs_chaser_team: [buffer_size, max_length, obs_chaser_team_dim]
+        obs_chaser_team = torch.zeros(
+            (self.buffer_size, max_length, self.obs_chaser_team_dim)
+        ).to(self.device)
+        # reward_chaser_team: [buffer_size, max_length, reward_chaser_team_dim]
+        reward_chaser_team = torch.zeros(
+            (self.buffer_size, max_length, self.reward_chaser_team_dim)
+        ).to(self.device)
         for i in range(self.buffer_size):
             length = lengths[i]
             obs[i, :length] = self.episodes[i]["obs"]
@@ -159,6 +171,8 @@ class RolloutBuffer:
             reward[i, :length] = self.episodes[i]["reward"]
             states[i, :length] = self.episodes[i]["states"]
             done[i, :length] = self.episodes[i]["done"]
+            obs_chaser_team[i, :length] = self.episodes[i]["obs_chaser_team"]
+            reward_chaser_team[i, :length] = self.episodes[i]["reward_chaser_team"]
             mask[i, :length] = 1
         if self.normalize_reward:
             mu = torch.mean(reward[mask])
@@ -176,6 +190,8 @@ class RolloutBuffer:
             done.float(),
             mask,
             role_ids_expanded,
+            obs_chaser_team.float(),
+            reward_chaser_team.float(),
         )
 
 
@@ -331,6 +347,8 @@ class ActorMultiHead(nn.Module):
 
     def act(self, obs, role_ids):
         """Sample actions for all agents based on their roles.
+        
+        注意这边的observation在仿真训练的时候，出于方便，直接把我方chaser_team的
 
         Args:
             obs: [batch_size, num_agents, obs_dim] Observations
@@ -343,14 +361,14 @@ class ActorMultiHead(nn.Module):
         batch_size, num_agents, _ = obs.shape
         device = obs.device
 
-        # Build one-hot agent IDs
+        # Build one-hot agent IDs 只有两个角色 [1,0] [0,1] onehot编码区分
         agent_ids_onehot = self._build_agent_id_onehot(batch_size, num_agents, role_ids, device)
 
         # Concatenate obs with agent IDs
         x = torch.cat([obs, agent_ids_onehot], dim=-1)  # [batch, num_agents, obs+id（也就是chaser_team_obs_dim+2=15个维度）]
 
         # Flatten for shared body processing
-        x = x.reshape(batch_size * num_agents, -1) # [batch * num_angents, obs+id（也就是15+2=17)]
+        x = x.reshape(batch_size * num_agents, -1) # [batch * num_agents, obs+id（也就是15+2=17)]
         shared_features = self.shared_body(x)
         shared_features = shared_features.reshape(batch_size, num_agents, -1)
 
@@ -359,12 +377,12 @@ class ActorMultiHead(nn.Module):
         log_probs = torch.zeros(batch_size, num_agents, device=device)
         chosen_heads = torch.zeros(batch_size, num_agents, dtype=torch.long, device=device)
 
-        for role_idx in range(self.num_roles):
+        for role_idx in range(self.num_roles): # 两个角色Herder, Netter
             mask = (role_ids == role_idx)
             if mask.any(): # 如果张量中至少有一个元素为 True（对于布尔类型）或非零值（对于数值类型），它就返回 True；
                 # Get features for agents with this role
                 role_features = shared_features[mask]  # [num_matching, hidden_dim]
-                mean = torch.tanh(self.role_heads[role_idx](role_features)) # todo: verify 这些公式是否正确！
+                mean = torch.tanh(self.role_heads[role_idx](role_features))
                 std = torch.exp(self.log_stds[role_idx]).expand_as(mean)
                 dist = torch.distributions.Normal(mean, std)
                 sampled_actions = torch.clamp(dist.sample(), -1.0, 1.0)
@@ -577,7 +595,7 @@ def env_worker(conn, env_config: EnvConfig, seed):
 
 class UnityEnvWrapper:
     """包装 UnityParallelEnv 以提供统一的接口"""
-    def __init__(self, unity_parallel_env, max_steps=900):
+    def __init__(self, unity_parallel_env: UnityParallelEnv, max_steps=900):
         self.env = unity_parallel_env
         self.n_agents = len(unity_parallel_env.possible_agents)
         self.agents = unity_parallel_env.possible_agents
@@ -772,14 +790,7 @@ class UnityEnvWrapper:
         obs_list = []
         for i, agent in enumerate(self.agents):
             obs = obs_dict[agent]
-            # 如果是元组（多个观察），展平并拼接
-            if isinstance(obs, tuple):
-                obs = np.concatenate([np.array(o).flatten() for o in obs])
-            elif isinstance(obs, dict) and "observation" in obs:
-                obs = np.concatenate([np.array(o).flatten() for o in obs["observation"]])
-            else:
-                obs = np.array(obs).flatten()
-            
+            obs = np.array(obs).flatten()
             # Padding到统一维度
             if len(obs) < self.obs_size:
                 obs = np.pad(obs, (0, self.obs_size - len(obs)), constant_values=0)
@@ -787,8 +798,8 @@ class UnityEnvWrapper:
                 obs = obs[:self.obs_size]  # 截断（理论上不应该发生）
             
             obs_list.append(obs)
-        obs_array = np.array(obs_list)
-
+        obs_array = np.array(obs_list) # todo: 修改先把obs_array和reward作为输入向量一一对齐！和每个角色固定位置对齐！
+        
         # 分离 Chaser方（Herder + Netter）和 Prey 的奖励
         chaser_rewards = []
         prey_reward = 0.0
@@ -807,17 +818,7 @@ class UnityEnvWrapper:
                     netter_rewards.append(float(r))
 
         # Chaser方的全局奖励 = Herder + 两个Netter的总和
-        global_reward_chaser = sum(chaser_rewards) if chaser_rewards else 0.0
-
-        # 将每个角色的奖励存入 rewards_detail（供后续存入Buffer）
-        # todo: 思考后面怎么把rewards_detail正确传递给每个神经网络
-        rewards_detail = {
-            "herder": herder_reward,
-            "netter": netter_rewards,  # [netter0_reward, netter1_reward]
-            "prey": prey_reward,
-            "global_chaser": global_reward_chaser,
-        }
-        info_dict["rewards_detail"] = rewards_detail
+        global_reward_chaser = sum(chaser_rewards) if chaser_rewards else 0.0 # 仅仅只是训练的时候的一个接口
 
         # 返回给外界的 reward 是 Chaser 方的全局奖励
         reward = global_reward_chaser
@@ -831,6 +832,52 @@ class UnityEnvWrapper:
         truncated = self._current_step >= self.max_steps
         if truncated and not done:
             print(f"Episode truncated at step {self._current_step} (max_steps={self.max_steps})")
+
+        # 生成 obs_chaser_team 和 reward_chaser_team: 按 [Herder, Netter1, Netter2] 顺序排列
+        herder_obs = None
+        netter1_obs = None
+        netter2_obs = None
+        netter1_id = None
+        netter2_id = None
+
+        herder_reward = None
+        netter1_reward = None
+        netter2_reward = None
+
+        for agent_name, obs in obs_dict.items():
+            role_id = get_role_from_agent_name(agent_name)
+            obs = np.array(obs).flatten()
+            reward = float(reward_dict.get(agent_name, 0.0))
+            agent_id = int(agent_name.split("agent_id=")[1])
+
+            if role_id == ROLE_MAPPING["Herder"]:
+                herder_obs = obs
+                herder_reward = reward
+            elif role_id == ROLE_MAPPING["Netter"]:
+                # 从 agent_name 中提取 agent_id 用于排序
+                if netter1_obs is None or agent_id < netter1_id:
+                    netter2_obs = netter1_obs
+                    netter2_id = netter1_id
+                    netter1_obs = obs
+                    netter1_id = agent_id
+                    netter2_reward = netter1_reward
+                    netter1_reward = reward
+                else:
+                    netter2_obs = obs
+                    netter2_id = agent_id
+                    netter2_reward = reward
+
+        # 组装 obs_chaser_team
+        obs_chaser_team = np.concatenate([herder_obs, netter1_obs, netter2_obs])
+
+        # 组装 reward_chaser_team: [r_Herder, r_Netter1, r_Netter2]
+        reward_chaser_team = np.array([herder_reward, netter1_reward, netter2_reward], dtype=np.float32)
+
+        info_dict["obs_chaser_team"] = obs_chaser_team
+        info_dict["reward_chaser_team"] = reward_chaser_team
+        
+        
+        
 
         return obs_array, reward, done, truncated, info_dict
     
@@ -851,13 +898,7 @@ class UnityEnvWrapper:
         obs_list = []
         for i, agent in enumerate(self.agents):
             obs = self._last_obs[agent]
-            if isinstance(obs, tuple):
-                obs = np.concatenate([np.array(o).flatten() for o in obs])
-            elif isinstance(obs, dict) and "observation" in obs:
-                obs = np.concatenate([np.array(o).flatten() for o in obs["observation"]])
-            else:
-                obs = np.array(obs).flatten()
-            
+            obs = np.array(obs).flatten()
             # Padding到统一维度
             if len(obs) < self.obs_size:
                 obs = np.pad(obs, (0, self.obs_size - len(obs)), constant_values=0)
@@ -995,7 +1036,7 @@ if __name__ == "__main__":
         agent_id_dim=2,  # One-hot encoding for all role types
     ).to(device)
     critic = Critic(
-        input_dim=chaser_team_obs_dim * 3, # 15 * 4 = 60，使用padding之后的最大的prey的state_size？
+        input_dim=chaser_team_obs_dim * 3, # 13 * 3 = 39，按照$S = [o_{Herder}, o_{Netter1}, o_{Netter2}]$的方式拼接
         hidden_dim=args.critic_hidden_dim,
         num_layer=args.critic_num_layers,
     ).to(device)
@@ -1032,6 +1073,8 @@ if __name__ == "__main__":
         normalize_reward=args.normalize_reward,
         device=device,
         role_ids=role_ids,
+        obs_chaser_team_dim=chaser_team_obs_dim * 3,  # 39 = 3 agents * 13 dims
+        reward_chaser_team_dim=3,  # [r_Herder, r_Netter1, r_Netter2]
     )
     ep_rewards = []
     ep_lengths = []
@@ -1049,6 +1092,8 @@ if __name__ == "__main__":
                 "reward": [],
                 "states": [],
                 "done": [],
+                "obs_chaser_team": [],
+                "reward_chaser_team": [],
             }
             for _ in range(args.batch_size)
         ]
@@ -1105,13 +1150,30 @@ if __name__ == "__main__":
             truncated = [content["truncated"] for content in contents]
             infos = [content.get("infos") for content in contents]
             next_state = [content["next_state"] for content in contents]
+            # 从 infos 中提取 obs_chaser_team 和 reward_chaser_team
+            obs_chaser_team_list = []
+            reward_chaser_team_list = []
+            for i, info in enumerate(infos):
+                if info is not None and "obs_chaser_team" in info:
+                    obs_chaser_team_list.append(info["obs_chaser_team"])
+                else:
+                    # Fallback: 使用零向量
+                    obs_chaser_team_list.append(np.zeros(39))
+                if info is not None and "reward_chaser_team" in info:
+                    reward_chaser_team_list.append(info["reward_chaser_team"])
+                else:
+                    # Fallback: 使用零向量
+                    reward_chaser_team_list.append(np.zeros(3))
             for i, j in enumerate(alive_envs):
                 episodes[j]["obs"].append(obs[i])
                 episodes[j]["actions"].append(actions[i])
                 episodes[j]["log_prob"].append(log_probs[i])
                 episodes[j]["reward"].append(reward[i])
+                episodes[j]["infos"].append(infos[i])
                 episodes[j]["states"].append(state[i])
                 episodes[j]["done"].append(done[i])
+                episodes[j]["obs_chaser_team"].append(obs_chaser_team_list[i])
+                episodes[j]["reward_chaser_team"].append(reward_chaser_team_list[i])
                 ep_reward[j] += reward[i]
                 ep_length[j] += 1
             step += len(alive_envs)
@@ -1155,14 +1217,16 @@ if __name__ == "__main__":
             ep_stats = []
         ## Collate episodes in buffer into single batch
         (
-            b_obs,
+            b_obs, # 每个Agent自己的obs，用于输入到Actor网络
             b_actions,
             b_log_probs,
             b_reward,
-            b_states,
+            b_states, # 全局状态，所有Agents的obs的拼接，为env.get_states()返回值。目前不使用改成chaser_team的obs，输入到Critic网络
             b_done,
             b_mask,
             b_role_ids,
+            b_obs_chaser_team,
+            b_reward_chaser_team,
         ) = rb.get_batch()
 
         # Compute the advantage
@@ -1179,7 +1243,7 @@ if __name__ == "__main__":
                     if t == (ep_len - 1):
                         next_value = 0
                     else:
-                        next_value = critic(x=b_states[ep_idx, t + 1])
+                        next_value = critic(x=b_obs_chaser_team[ep_idx, t + 1])
                     return_lambda[ep_idx, t] = last_return_lambda = b_reward[
                         ep_idx, t
                     ] + args.gamma * (
@@ -1187,7 +1251,7 @@ if __name__ == "__main__":
                         + (1 - args.td_lambda) * next_value
                     )
                     advantages[ep_idx, t] = return_lambda[ep_idx, t] - critic(
-                        x=b_states[ep_idx, t]
+                        x=b_obs_chaser_team[ep_idx, t]
                     )
         if args.normalize_advantage:
             adv_mu = advantages.mean(dim=-1)[b_mask].mean()
